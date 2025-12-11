@@ -1,30 +1,50 @@
+// OCR Types - General purpose document scanning
+
+export interface ReceiptItem {
+  id?: number;
+  name: string;
+  quantity: number;
+  unit_price: number | null;
+  total_price: number | null;
+}
+
+export interface ParsedReceipt {
+  store_name: string | null;
+  items: ReceiptItem[];
+  subtotal: number | null;
+  tax: number | null;
+  total: number | null;
+}
 
 export interface OcrBlock {
   text: string;
-  box: number[];
-  confidence?: number;
+  confidence: number;
+  _x: number;
+  _y: number;
+  _w: number;
+  _h: number;
+}
+
+export interface TableRow {
+  row: number;
+  cells: string[];
+  confidences: number[];
 }
 
 export interface OcrResponse {
-  // Core fields from backend
-  success?: boolean;
-  filename?: string;
-  layout?: {
-    columns?: number;
-    rows?: number;
-    gap_size?: number;
-    [key: string]: any;
-  };
-  parsed?: string;
-  raw_text?: string;
+  success: boolean;
+  filename: string;
   blocks: OcrBlock[];
-  
-  // Legacy/Computed fields
-  text?: string; 
+  raw_text: string;
+  parsed: ParsedReceipt;
+  error?: string;
+  // Layout analysis results
+  table_rows?: TableRow[];
   column_count?: number;
   row_count?: number;
 }
 
+// Simplified scan storage - just filename, raw text, and timestamp
 export interface Scan {
   id: number;
   filename: string;
@@ -32,14 +52,32 @@ export interface Scan {
   created_at: string;
 }
 
-export interface BackendLogEntry {
-  ts: number;
-  msg: string;
+// Legacy Receipt type - kept for backwards compatibility during transition
+export interface Receipt {
+  id: number;
+  filename: string;
+  store_name: string | null;
+  receipt_date: string | null;
+  subtotal: number | null;
+  tax: number | null;
+  total: number | null;
+  raw_text: string;
+  created_at: string;
+  items?: ReceiptItem[];
 }
 
-export interface HealthStats {
-  status: 'online' | 'offline';
-  cpu_percent?: number;
-  memory_used?: number; // MB
-  memory_total?: number; // MB
+export interface LogEntry {
+  timestamp: string;
+  level: 'info' | 'success' | 'warn' | 'error';
+  message: string;
 }
+
+export interface BackendHealth {
+  status: 'checking' | 'healthy' | 'unhealthy';
+  ocr_engine?: string;
+  database?: string;
+}
+
+export type OcrEngine = 'docker' | 'tesseract';
+
+export type OutputTab = 'text' | 'json' | 'csv' | 'xlsx' | 'sql';

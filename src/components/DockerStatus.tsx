@@ -1,227 +1,309 @@
-import React, { useEffect, useState, useRef } from 'react';
+/**
+ * Docker Status Component
+ * Shows connection status and setup instructions for the backend container
+ */
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { dockerHealthService } from '../services/dockerHealthService';
-import { backendLogService } from '../services/backendLogService';
-import { HealthStats } from '../types';
+import type { DockerHealthStatus } from '../services/dockerHealthService';
+import { systemLogger } from '../services/systemLogger';
 
-interface Process {
-  pid: number;
-  name: string;
-  username: string;
-  cpu_percent: number;
-  memory_percent: number;
+// Frontend version - must match backend BACKEND_VERSION for full compatibility
+const FRONTEND_VERSION = '1.0.0';
+
+interface DockerStatusProps {
+  onStatusChange?: (isHealthy: boolean) => void;
+  onTroubleshoot?: () => void;
 }
 
-export const DockerStatus: React.FC = () => {
-  const [health, setHealth] = useState<HealthStats>({ status: 'offline' });
-  const [showMonitor, setShowMonitor] = useState(false);
-  const [topProcs, setTopProcs] = useState<Process[]>([]);
-  const [netRx, setNetRx] = useState(0);
-  
-  // Track last log time to determine if stream is active
-  const lastLogTimeRef = useRef<number>(0);
+export const DockerStatus = ({ onStatusChange, onTroubleshoot }: DockerStatusProps) => {
+  const [status, setStatus] = useState<DockerHealthStatus | null>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [copied, setCopied] = useState(false);
 
+  // Use refs to prevent re-registering monitoring on every render
+  const onStatusChangeRef = useRef(onStatusChange);
+  const hasStartedRef = useRef(false);
+
+  // Keep ref updated
   useEffect(() => {
-    // 1. Poll /health endpoint for Backend connectivity and stats
-    const check = async () => {
-      const stats = await dockerHealthService.checkHealth();
-      const now = Date.now();
-      const isStreamActive = (now - lastLogTimeRef.current) < 10000;
-      
-      const effectiveStatus = (stats.status === 'online' || isStreamActive) ? 'online' : 'offline';
+    onStatusChangeRef.current = onStatusChange;
+  }, [onStatusChange]);
 
-      setHealth(prev => ({
-        ...prev,
-        status: effectiveStatus,
-        // Prefer polled stats, will fallback to log-streamed stats if undefined
-        cpu_percent: stats.cpu_percent ?? prev.cpu_percent,
-        memory_used: stats.memory_used ?? prev.memory_used,
-        memory_total: stats.memory_total ?? prev.memory_total
-      }));
-    };
-    
-    check();
-    const interval = setInterval(check, 2000); // Fast poll for responsiveness
-
-    // 2. Listen to Log Stream for real-time metrics pushed by psutil
-    const unsubscribe = backendLogService.startStreaming((log) => {
-      lastLogTimeRef.current = Date.now();
-      
-      if (!log || !log.msg) return;
-      const msg = log.msg;
-
-      // Parse [METRIC] from app.py
-      // Format: [METRIC] CPU: 12.5% RAM: 512/2048MB NET_RX: 120.5MB
-      if (msg.includes('[METRIC]')) {
-         const cpuMatch = msg.match(/CPU:\s*([\d.]+)%/);
-         const ramMatch = msg.match(/RAM:\s*([\d.]+)\/([\d.]+)MB/);
-         const netMatch = msg.match(/NET_RX:\s*([\d.]+)MB/);
-
-         if (cpuMatch) {
-             setHealth(prev => ({
-                 ...prev,
-                 status: 'online',
-                 cpu_percent: parseFloat(cpuMatch[1]),
-                 memory_used: ramMatch ? parseFloat(ramMatch[1]) : prev.memory_used,
-                 memory_total: ramMatch ? parseFloat(ramMatch[2]) : prev.memory_total
-             }));
-         }
-         if (netMatch) {
-             setNetRx(parseFloat(netMatch[1]));
-         }
-      }
-
-      // Parse [TOP] logs
-      if (msg.includes('[TOP]')) {
-          try {
-              const jsonStr = msg.replace('[TOP] ', '');
-              const procs = JSON.parse(jsonStr);
-              setTopProcs(procs);
-          } catch (e) {
-              console.error("Failed to parse TOP log", e);
-          }
-      }
-    });
-
-    return () => {
-      clearInterval(interval);
-      unsubscribe();
-    };
+  // Stable callback that uses ref
+  const handleStatusChange = useCallback((newStatus: DockerHealthStatus) => {
+    setStatus(newStatus);
+    onStatusChangeRef.current?.(newStatus.isHealthy);
   }, []);
 
-  const isConnected = health.status === 'online';
+  useEffect(() => {
+    // Only start monitoring once
+    if (hasStartedRef.current) return;
+    hasStartedRef.current = true;
 
-  const toggleMonitor = () => {
-    setShowMonitor(!showMonitor);
+    systemLogger.info('docker', '🐳 Starting Docker health monitoring...');
+
+    dockerHealthService.startMonitoring((newStatus) => {
+      handleStatusChange(newStatus);
+
+      // Only log on status changes, not every health check
+      // The service already logs via systemLogger interceptor
+    });
+
+    return () => dockerHealthService.stopMonitoring();
+  }, [handleStatusChange]);
+
+  const handleRetry = async () => {
+    setChecking(true);
+    systemLogger.info('docker', '🔄 Retrying Docker connection...');
+
+    const newStatus = await dockerHealthService.forceCheck();
+    setStatus(newStatus);
+    onStatusChange?.(newStatus.isHealthy);
+    setChecking(false);
   };
 
-  const getCpuColor = (percent: number = 0) => {
-    if (percent < 50) return '#28a745'; 
-    if (percent < 80) return '#fd7e14'; 
-    return '#dc3545'; 
+  // Derived values (computed from state, not hooks)
+  const instructions = dockerHealthService.getSetupInstructions();
+  const isGitHubPages = window.location.hostname.includes('github.io');
+  const isWindows = navigator.userAgent.toLowerCase().includes('win');
+  const isNetworkAccess = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
+  const scriptUrl = isWindows
+    ? 'https://raw.githubusercontent.com/swipswaps/receipts-ocr/main/scripts/setup.ps1'
+    : 'https://raw.githubusercontent.com/swipswaps/receipts-ocr/main/scripts/setup.sh';
+  const oneLiner = isWindows
+    ? 'irm https://raw.githubusercontent.com/swipswaps/receipts-ocr/main/scripts/setup.ps1 | iex'
+    : 'curl -fsSL https://raw.githubusercontent.com/swipswaps/receipts-ocr/main/scripts/setup.sh | bash';
+  // Platform-specific firewall commands
+  const firewallCmd = isWindows
+    ? "New-NetFirewallRule -DisplayName 'PaddleOCR' -Direction Inbound -Protocol TCP -LocalPort 5173,5001 -Action Allow"
+    : 'sudo firewall-cmd --add-port=5173/tcp --add-port=5001/tcp --permanent && sudo firewall-cmd --reload';
+
+  const copyOneLiner = async () => {
+    try {
+      await navigator.clipboard.writeText(oneLiner);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Fallback for older browsers
+      const ta = document.createElement('textarea');
+      ta.value = oneLiner;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
   };
 
-  const cpuVal = health.cpu_percent ?? 0;
-  const memUsed = health.memory_used ?? 0;
-  const memTotal = health.memory_total || 2048;
+  // Early returns for loading and healthy states
+  if (!status) {
+    return (
+      <div className="docker-status checking">
+        <span className="status-icon">🔄</span>
+        <span>Checking Docker connection...</span>
+      </div>
+    );
+  }
 
-  const renderTextBar = (percent: number, width: number = 20) => {
-    const filled = Math.min(width, Math.max(0, Math.round((percent / 100) * width)));
-    const empty = width - filled;
-    return '|'.repeat(filled) + ' '.repeat(empty);
-  };
+  // Check version mismatch
+  const versionMismatch = status?.backendVersion && status.backendVersion !== FRONTEND_VERSION;
 
+  if (status.isHealthy) {
+    return (
+      <div className={`docker-status healthy ${versionMismatch || isNetworkAccess ? 'with-warning' : ''}`}>
+        <div className="status-main">
+          <span className="status-icon">✅</span>
+          <span>PaddleOCR Ready</span>
+          {status.backendVersion && <span className="badge version">v{status.backendVersion}</span>}
+          {isNetworkAccess && <span className="badge network">🌐 {window.location.hostname}</span>}
+        </div>
+        {versionMismatch && (
+          <div className="version-warning">
+            <span className="warning-icon">⚠️</span>
+            <span>Backend v{status.backendVersion} ≠ Frontend v{FRONTEND_VERSION}</span>
+            <button
+              className="update-link"
+              onClick={() => setExpanded(!expanded)}
+              title="Show update instructions"
+            >
+              Update →
+            </button>
+            {expanded && (
+              <div className="update-instructions">
+                <p>Run these commands to update:</p>
+                <code>
+                  git pull origin main<br />
+                  docker compose up -d --build
+                </code>
+              </div>
+            )}
+          </div>
+        )}
+        {/* Show network troubleshooting when accessed from network but backend might be blocked */}
+        {isNetworkAccess && !versionMismatch && (
+          <div className="network-info">
+            <button
+              className="network-help-link"
+              onClick={() => setExpanded(!expanded)}
+            >
+              🔧 Network access help
+            </button>
+            {expanded && (
+              <div className="network-help">
+                <p className="help-title">Can't connect from other devices?</p>
+                <p className="help-desc">
+                  Your firewall may be blocking connections. Run this command in {isWindows ? 'PowerShell (as Admin)' : 'terminal'}
+                  to allow access on ports 5173 (frontend) and 5001 (backend):
+                </p>
+                <div className="cmd-box">
+                  <code>{firewallCmd}</code>
+                  <button
+                    className="copy-btn"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(firewallCmd);
+                        setCopied(true);
+                        setTimeout(() => setCopied(false), 2000);
+                      } catch {
+                        // Fallback for older browsers
+                        const el = document.createElement('textarea');
+                        el.value = firewallCmd;
+                        document.body.appendChild(el);
+                        el.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(el);
+                        setCopied(true);
+                        setTimeout(() => setCopied(false), 2000);
+                      }
+                    }}
+                    title="Copy to clipboard"
+                  >
+                    {copied ? '✓ Copied' : '📋 Copy'}
+                  </button>
+                </div>
+                <p className="help-note">
+                  After running, other devices on your network can access:<br />
+                  <strong>http://{window.location.hostname}:5173</strong>
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Unhealthy state - show setup instructions
   return (
-    <div style={{ position: 'relative', zIndex: 1000 }}>
-      <div 
-        className={`status-indicator ${isConnected ? 'connected' : 'disconnected'}`}
-        style={{ gap: '12px', paddingRight: '4px', cursor: 'pointer', userSelect: 'none' }}
-        onClick={toggleMonitor}
-      >
-        <div className="status-dot"></div>
-        <span style={{ marginRight: '8px' }}>{isConnected ? 'System Ready' : 'Backend Offline'}</span>
-
-        {/* Real Stats Display */}
-        <span style={{
-            background: showMonitor ? '#ccc' : 'rgba(0,0,0,0.05)',
-            borderRadius: '4px',
-            padding: '2px 6px',
-            fontSize: '0.75rem',
-            fontWeight: 'bold',
-            color: '#333',
-            display: 'flex',
-            gap: '8px'
-        }}>
-            <span>CPU: {cpuVal.toFixed(1)}%</span>
-            <span style={{ borderLeft: '1px solid #999', paddingLeft: '8px' }}>
-                RAM: {Math.round(memUsed)}M
-            </span>
-        </span>
+    <div className="docker-status unhealthy">
+      <div className="status-header" onClick={() => setExpanded(!expanded)}>
+        <span className="status-icon">⚠️</span>
+        <span className="status-text">Docker Backend Required</span>
+        <span className="expand-icon">{expanded ? '▼' : '▶'}</span>
       </div>
 
-      {showMonitor && (
-        <div className="system-monitor-window" style={{
-            position: 'absolute',
-            top: '40px',
-            right: '0',
-            width: '450px',
-            background: '#1e1e1e',
-            border: '1px solid #444',
-            borderRadius: '6px',
-            boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
-            fontFamily: 'monospace',
-            fontSize: '0.75rem',
-            color: '#ccc',
-            overflow: 'hidden'
-        }}>
-            <div style={{
-                background: '#333',
-                padding: '4px 8px',
-                display: 'flex',
-                justifyContent: 'space-between',
-                borderBottom: '1px solid #444',
-                fontWeight: 'bold',
-                color: '#fff',
-                userSelect: 'none'
-            }}>
-              <span>System Monitor (Real-time)</span>
-              <span style={{cursor:'pointer'}} onClick={() => setShowMonitor(false)}>✕</span>
+      {expanded && (
+        <div className="status-details">
+          {isGitHubPages && (
+            <div className="github-pages-notice">
+              <p><strong>🌐 You're viewing this on GitHub Pages</strong></p>
+              <p>This is a <em>frontend-only</em> demo. For high-accuracy PaddleOCR, run the setup locally.</p>
             </div>
-            
-            <div style={{ padding: '12px' }}>
-              {/* CPU Bar */}
-              <div style={{ marginBottom: '4px', display: 'flex', justifyContent: 'space-between' }}>
-                <span>CPU  [{renderTextBar(cpuVal, 25)}]</span>
-                <span style={{ color: getCpuColor(cpuVal), fontWeight: 'bold' }}>{cpuVal.toFixed(1)}%</span>
-              </div>
-              {/* Memory Bar */}
-              <div style={{ marginBottom: '8px', display: 'flex', justifyContent: 'space-between' }}>
-                <span>MEM  [{renderTextBar((memUsed/memTotal)*100, 25)}]</span>
-                <span style={{ color: getCpuColor((memUsed/memTotal)*100), fontWeight: 'bold' }}>
-                    {Math.round(memUsed)} / {Math.round(memTotal)} MB
-                </span>
-              </div>
-              {/* Network I/O */}
-              <div style={{ marginBottom: '8px', display: 'flex', justifyContent: 'space-between', color: '#85c4ff' }}>
-                 <span>NET RX (Total)</span>
-                 <span>{netRx.toFixed(1)} MB</span>
-              </div>
-              
-              <div style={{ borderTop: '1px solid #444', margin: '8px 0' }}></div>
+          )}
 
-              {/* Process List Table */}
-              <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
-                  <thead>
-                      <tr style={{ color: '#000', background: '#ccc' }}>
-                          <th style={{padding: '2px'}}>PID</th>
-                          <th>NAME</th>
-                          <th>USER</th>
-                          <th>%CPU</th>
-                          <th>%MEM</th>
-                      </tr>
-                  </thead>
-                  <tbody>
-                      {topProcs.length === 0 ? (
-                          <tr><td colSpan={5} style={{textAlign:'center', color: '#666', padding: '10px'}}>Collecting process data...</td></tr>
-                      ) : (
-                          topProcs.map((proc) => (
-                              <tr key={proc.pid} style={{ borderBottom: '1px solid #333' }}>
-                                  <td style={{color: '#aaa'}}>{proc.pid}</td>
-                                  <td style={{color: '#fff'}}>{proc.name}</td>
-                                  <td>{proc.username}</td>
-                                  <td style={{color: getCpuColor(proc.cpu_percent)}}>{proc.cpu_percent.toFixed(1)}</td>
-                                  <td>{proc.memory_percent.toFixed(1)}</td>
-                              </tr>
-                          ))
-                      )}
-                  </tbody>
-              </table>
-              
-              <div style={{ marginTop: '8px', fontSize: '0.7rem', color: '#666', textAlign: 'center' }}>
-                  Backend: Flask + Gunicorn | Engine: PaddleOCR
-              </div>
+          <p className="error-message">
+            <strong>Status:</strong> {status.error || 'Cannot connect to backend on port 5001'}
+          </p>
+
+          {status.retryCount > 0 && (
+            <p className="retry-info">
+              Connection attempts: {status.retryCount} / 3
+            </p>
+          )}
+
+          <div className="fallback-info">
+            <p>📋 Currently using browser-based Tesseract.js (lower accuracy)</p>
+            <p>🚀 <strong>For 10x better results</strong>, run the automated setup:</p>
+          </div>
+
+          {/* One-click setup section */}
+          <div className="quick-setup">
+            <h4>🎯 Quick Setup (one command)</h4>
+            <p>Open {isWindows ? 'PowerShell (Admin)' : 'Terminal'} and paste:</p>
+            <div className="one-liner-container">
+              <code className="one-liner">{oneLiner}</code>
+              <button
+                className="copy-btn"
+                onClick={copyOneLiner}
+                title="Copy to clipboard"
+              >
+                {copied ? '✓' : '📋'}
+              </button>
             </div>
+            <p className="script-info">
+              This script will: check Docker → clone repo → build containers → start app
+              <br />
+              <small>All steps show real-time progress and error messages.</small>
+            </p>
+          </div>
+
+          {/* Manual steps as fallback */}
+          <details className="manual-steps">
+            <summary>📝 Or follow manual steps ({instructions.platform})</summary>
+            <ol>
+              {instructions.steps.map((step, i) => (
+                <li key={i}>
+                  {step.includes('docker') || step.includes('git') || step.includes('npm') || step.includes('curl') ? (
+                    <code>{step}</code>
+                  ) : (
+                    step
+                  )}
+                </li>
+              ))}
+            </ol>
+          </details>
+
+          <div className="status-actions">
+            <button
+              className="retry-btn"
+              onClick={handleRetry}
+              disabled={checking}
+            >
+              {checking ? '🔄 Checking...' : '🔁 Test Connection'}
+            </button>
+
+            <a
+              href={scriptUrl}
+              download
+              className="download-btn"
+            >
+              📥 Download Script
+            </a>
+
+            {onTroubleshoot && (
+              <button
+                className="troubleshoot-btn"
+                onClick={onTroubleshoot}
+              >
+                🔧 Diagnostics
+              </button>
+            )}
+          </div>
+
+          <a
+            href="https://github.com/swipswaps/receipts-ocr#troubleshooting-docker"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="github-link"
+          >
+            📚 Troubleshooting Guide
+          </a>
         </div>
       )}
     </div>
   );
 };
+
+export default DockerStatus;

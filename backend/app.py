@@ -1,260 +1,1678 @@
-import os
-import time
-import json
+"""
+PaddleOCR Backend - PaddleOCR + PostgreSQL REST API
+
+A Flask API for OCR using PaddleOCR with PostgreSQL storage.
+Based on patterns from Docker-OCR-2 llm_notes.
+"""
+
+from __future__ import annotations
+
+import base64
+import json as json_module
 import logging
-import threading
-import queue
-import psutil
-import psycopg2
-from flask import Flask, request, jsonify, Response, stream_with_context
-from flask_cors import CORS
-from werkzeug.utils import secure_filename
-from psycopg2.extras import RealDictCursor
+import os
+import re
+import subprocess
 import sys
+import tempfile
+import threading
+import time as time_module
+from collections import deque
+from threading import Lock
+from typing import TYPE_CHECKING, Any, TypedDict
 
-# Import OCR logic
-try:
-    from ocr import process_image
-except ImportError:
-    # Fallback for when running directly without package structure
-    from backend.ocr import process_image
+# Enable PaddlePaddle verbose logging BEFORE importing paddle
+os.environ.setdefault("GLOG_v", "1")
+os.environ.setdefault("GLOG_logtostderr", "1")
+os.environ.setdefault("FLAGS_call_stack_level", "2")
 
-app = Flask(__name__)
-CORS(app)
+import cv2
+import numpy as np
+import psycopg2
+import pytesseract
+from flask import Flask, Response, jsonify, request
+from flask_cors import CORS
+from paddleocr import PaddleOCR
+from psycopg2.extras import RealDictCursor
 
-# --- Configuration ---
-UPLOAD_FOLDER = '/tmp/uploads'
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'tiff', 'bmp', 'gif'}
-DB_HOST = os.environ.get('DB_HOST', 'db')
-DB_NAME = os.environ.get('DB_NAME', 'receipts')
-DB_USER = os.environ.get('DB_USER', 'postgres')
-DB_PASS = os.environ.get('DB_PASS', 'postgres')
 
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
+class LogEntry(TypedDict):
+    """Type for log buffer entries."""
 
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+    timestamp: float
+    level: str
+    message: str
 
-# --- Logging & SSE Setup ---
-# Thread-safe queue for log distribution
-log_queue = queue.Queue(maxsize=1000)
+
+if TYPE_CHECKING:
+    from psycopg2.extensions import connection
+
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# OpenCV Image Preprocessing for OCR Enhancement
+# -----------------------------------------------------------------------------
+
+
+def preprocess_for_ocr(img: np.ndarray) -> np.ndarray:
+    """
+    Apply OpenCV preprocessing to improve OCR accuracy.
+
+    Steps:
+    1. Convert to grayscale
+    2. Apply adaptive thresholding for better contrast
+    3. Denoise while preserving edges
+    4. Deskew if needed
+
+    Args:
+        img: BGR image from cv2.imdecode
+
+    Returns:
+        Preprocessed BGR image ready for OCR
+    """
+    h, w = img.shape[:2]
+    logger.info(f"[Preprocess] Input image: {w}x{h} pixels")
+
+    # Convert to grayscale for processing
+    logger.info("[Preprocess] Step 1/4: Converting to grayscale...")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Denoise while preserving edges
+    logger.info("[Preprocess] Step 2/4: Denoising (this may take a few seconds)...")
+    denoised = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
+
+    # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    logger.info("[Preprocess] Step 3/4: Enhancing contrast (CLAHE)...")
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(denoised)
+
+    # Detect and correct skew
+    logger.info("[Preprocess] Step 4/4: Detecting and correcting skew...")
+    enhanced = deskew_image(enhanced)
+
+    logger.info("[Preprocess] Complete - image ready for OCR")
+    # Convert back to BGR for PaddleOCR (it expects color images)
+    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+
+def deskew_image(gray: np.ndarray, max_angle: float = 10.0) -> np.ndarray:
+    """
+    Detect and correct image skew using Hough transform.
+
+    Args:
+        gray: Grayscale image
+        max_angle: Maximum skew angle to correct (degrees)
+
+    Returns:
+        Deskewed grayscale image
+    """
+    # Edge detection
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+
+    # Detect lines using Hough transform
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100, minLineLength=100, maxLineGap=10)
+
+    if lines is None or len(lines) < 3:
+        return gray  # Not enough lines to determine skew
+
+    # Calculate angles of detected lines
+    # HoughLinesP returns numpy array of shape (N, 1, 4) containing [x1, y1, x2, y2]
+    angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]  # type: ignore[index]
+        if x2 - x1 != 0:  # Avoid division by zero
+            angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+            # Only consider near-horizontal lines
+            if abs(angle) < max_angle:
+                angles.append(angle)
+
+    if not angles:
+        return gray
+
+    # Use median angle to avoid outliers
+    median_angle = float(np.median(angles))
+
+    if abs(median_angle) < 0.5:  # Skip if nearly straight
+        return gray
+
+    # Rotate to correct skew
+    h, w = gray.shape
+    center = (w // 2, h // 2)
+    rotation_matrix = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+    rotated = cv2.warpAffine(
+        gray, rotation_matrix, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+    )
+
+    logger.debug(f"Deskewed image by {median_angle:.2f} degrees")
+    return rotated
+
+
+# -----------------------------------------------------------------------------
+# Layout Analysis - Column-First Algorithm (from Docker-OCR-2)
+# -----------------------------------------------------------------------------
+# This algorithm properly handles multi-column layouts by:
+# 1. Detecting column boundaries using X-gap analysis
+# 2. Assigning blocks to columns
+# 3. Clustering blocks within columns into "cards" using Y-gap analysis
+# 4. Building table where row N = Nth card from each column
+# -----------------------------------------------------------------------------
+
+
+def analyze_layout_column_first(
+    blocks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Column-first layout analysis for multi-column documents.
+
+    This algorithm:
+    1. Detects column boundaries using X-gap analysis
+    2. Assigns each block to its column
+    3. Clusters blocks within each column into "cards" using Y-gaps
+    4. Builds table where row N = Nth card from each column
+
+    Args:
+        blocks: List of OCR blocks with _x, _y, _w, _h coordinates
+
+    Returns:
+        Layout analysis with table_rows, column_count, row_count, raw_text
+    """
+    if not blocks:
+        return {
+            "table_rows": [],
+            "column_count": 0,
+            "row_count": 0,
+            "raw_text": "",
+            "blocks": [],
+        }
+
+    # Calculate median dimensions for thresholds
+    heights = [b["_h"] for b in blocks]
+    widths = [b["_w"] for b in blocks]
+    median_height = sorted(heights)[len(heights) // 2] if heights else 30
+    median_width = sorted(widths)[len(widths) // 2] if widths else 100
+
+    # STEP 1: Detect column boundaries using X-gap analysis
+    all_x_starts = sorted({int(b["_x"]) for b in blocks})
+
+    x_gaps: list[tuple[int, int]] = []
+    for i in range(1, len(all_x_starts)):
+        gap = all_x_starts[i] - all_x_starts[i - 1]
+        x_gaps.append((gap, all_x_starts[i]))
+
+    col_boundaries = [all_x_starts[0]] if all_x_starts else [0]
+
+    if x_gaps:
+        gap_values = sorted([g[0] for g in x_gaps], reverse=True)
+
+        # Adaptive threshold: use statistical outlier detection for column gaps
+        # Column gaps are typically much larger than word gaps
+        if len(gap_values) >= 3:
+            # Use median gap as baseline - gaps > 3x median are column separators
+            median_gap = sorted(gap_values)[len(gap_values) // 2]
+            gap_threshold = max(median_gap * 3, median_width * 0.8, 100)
+        else:
+            # Fallback for few gaps: use adaptive minimum
+            gap_threshold = max(median_width * 1.0, 150)
+
+        logger.debug(f"X gaps (largest 5): {gap_values[:5]}, threshold: {gap_threshold:.0f}px")
+
+        for gap_size, x_pos in x_gaps:
+            if gap_size >= gap_threshold:
+                col_boundaries.append(x_pos)
+        col_boundaries.sort()
+
+    num_cols = len(col_boundaries)
+    logger.debug(f"Column boundaries ({num_cols}): {col_boundaries}")
+
+    # STEP 2: Assign each block to a column
+    columns: dict[int, list[dict[str, Any]]] = {i: [] for i in range(num_cols)}
+    for block in blocks:
+        block_x = block["_x"]
+        col_idx = 0
+        for i, col_x in enumerate(col_boundaries):
+            if block_x >= col_x - 50:  # Allow some tolerance
+                col_idx = i
+        columns[col_idx].append(block)
+
+    logger.debug(f"Blocks per column: {[len(columns[i]) for i in range(num_cols)]}")
+
+    # STEP 3: Cluster blocks within each column into cards using Y-gaps
+    y_gap_threshold = median_height * 1.2
+
+    def cluster_column_blocks(col_blocks: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        """Cluster text blocks within a column into separate cards."""
+        if not col_blocks:
+            return []
+
+        sorted_blocks = sorted(col_blocks, key=lambda b: b["_y"])
+        y_positions = [(b["_y"], b["_y"] + b["_h"], b) for b in sorted_blocks]
+
+        cards: list[list[dict[str, Any]]] = []
+        current_card: list[dict[str, Any]] = [y_positions[0][2]]
+        current_y_max = y_positions[0][1]
+
+        for y_min, y_max, block in y_positions[1:]:
+            gap = y_min - current_y_max
+            if gap >= y_gap_threshold:
+                # New card - significant vertical gap
+                cards.append(current_card)
+                current_card = [block]
+                current_y_max = y_max
+            else:
+                # Same card
+                current_card.append(block)
+                current_y_max = max(current_y_max, y_max)
+
+        if current_card:
+            cards.append(current_card)
+
+        return cards
+
+    column_cards: dict[int, list[list[dict[str, Any]]]] = {}
+    max_cards_per_col = 0
+    for col_idx in range(num_cols):
+        cards = cluster_column_blocks(columns[col_idx])
+        column_cards[col_idx] = cards
+        max_cards_per_col = max(max_cards_per_col, len(cards))
+
+    logger.debug(f"Cards per column: {[len(column_cards[i]) for i in range(num_cols)]}")
+
+    num_rows = max_cards_per_col
+    logger.info(f"Layout: {num_cols} columns x {num_rows} rows")
+
+    # STEP 4: Build table - each row is the Nth card from each column
+    table_rows: list[dict[str, Any]] = []
+    result_blocks: list[dict[str, Any]] = []
+    extracted_lines: list[str] = []
+
+    for row_idx in range(num_rows):
+        row_cells: list[str] = [""] * num_cols
+        row_confidences: list[float] = [0.0] * num_cols
+
+        for col_idx in range(num_cols):
+            cards = column_cards[col_idx]
+            if row_idx < len(cards):
+                card_blocks = cards[row_idx]
+                # Sort blocks within card by Y then X for reading order
+                sorted_card = sorted(card_blocks, key=lambda b: (b["_y"], b["_x"]))
+                raw_card_text = " ".join([b["text"] for b in sorted_card])
+                # Apply OCR text cleaning
+                card_text = clean_ocr_text(raw_card_text)
+                card_conf = max([b["confidence"] for b in sorted_card]) if sorted_card else 0.0
+                row_cells[col_idx] = card_text
+                row_confidences[col_idx] = card_conf
+
+        table_rows.append({"row": row_idx, "cells": row_cells, "confidences": row_confidences})
+
+        # Add to result blocks with row/col info
+        for col_idx, cell_text in enumerate(row_cells):
+            if cell_text:
+                result_blocks.append(
+                    {
+                        "text": cell_text,
+                        "confidence": row_confidences[col_idx],
+                        "row": row_idx,
+                        "col": col_idx,
+                        "_x": 0,
+                        "_y": row_idx * 50,
+                        "_w": 200,
+                        "_h": 40,
+                    }
+                )
+
+        # Build text: each cell on its own line for better readability
+        # For multi-column documents, add column prefix for clarity
+        for cell_text in row_cells:
+            if cell_text.strip():
+                if num_cols > 1:
+                    # Multi-column: prefix with row number for clarity
+                    extracted_lines.append(f"{row_idx + 1}\t{cell_text}")
+                else:
+                    extracted_lines.append(cell_text)
+
+    raw_text = "\n".join(extracted_lines)
+
+    return {
+        "table_rows": table_rows,
+        "column_count": num_cols,
+        "row_count": num_rows,
+        "raw_text": raw_text,
+        "blocks": result_blocks,
+    }
+
+
+# Configuration
+# -----------------------------------------------------------------------------
+MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50 MB max file size
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif"}
+
+# PostgreSQL configuration - use environment variables
+DB_CONFIG = {
+    "host": os.environ.get("POSTGRES_HOST", "localhost"),
+    "port": os.environ.get("POSTGRES_PORT", "5432"),
+    "database": os.environ.get("POSTGRES_DB", "receipts_ocr"),
+    "user": os.environ.get("POSTGRES_USER", "postgres"),
+    "password": os.environ.get("POSTGRES_PASSWORD", "postgres"),
+}
+
+# Configure logging - use stderr so gunicorn captures it with --capture-output
+handler = logging.StreamHandler(sys.stderr)
+handler.setLevel(logging.INFO)
+handler.setFormatter(
+    logging.Formatter("[%(asctime)s] [%(levelname)7s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+)
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.addHandler(handler)
+logger.propagate = False
+
+# -----------------------------------------------------------------------------
+# Log Buffer for SSE Streaming (Issue #27)
+# Stores recent logs to stream to frontend in real-time
+# -----------------------------------------------------------------------------
+
+log_buffer: deque[LogEntry] = deque(maxlen=100)
+log_buffer_lock = Lock()
+
 
 class LogBufferHandler(logging.Handler):
-    def emit(self, record):
+    """Custom handler that writes logs to a buffer for SSE streaming."""
+
+    def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = self.format(record)
-            log_queue.put(json.dumps({
-                'ts': record.created,
-                'level': record.levelname,
-                'msg': msg
-            }))
-        except queue.Full:
-            pass # Drop logs if queue is full to prevent blocking
+            with log_buffer_lock:
+                log_buffer.append(
+                    {
+                        "timestamp": time_module.time(),
+                        "level": record.levelname,
+                        "message": msg,
+                    }
+                )
+        except Exception:
+            self.handleError(record)
 
-# Setup Root Logger
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+
+# Add buffer handler to capture logs for streaming
 buffer_handler = LogBufferHandler()
-formatter = logging.Formatter('%(message)s')
-buffer_handler.setFormatter(formatter)
+buffer_handler.setLevel(logging.INFO)
+buffer_handler.setFormatter(logging.Formatter("[%(levelname)7s] %(message)s"))
 logger.addHandler(buffer_handler)
 
-# Capture stdout/stderr to push to log_queue as well (for Paddle/System logs)
-class StreamToLogger(object):
-    def __init__(self, logger, level):
-        self.logger = logger
-        self.level = level
-        self.linebuf = ''
+# Capture PaddlePaddle and related library logs too
+for paddle_logger_name in ["paddle", "paddleocr", "ppocr", "urllib3"]:
+    paddle_logger = logging.getLogger(paddle_logger_name)
+    paddle_logger.setLevel(logging.INFO)
+    paddle_logger.addHandler(buffer_handler)
+    paddle_logger.addHandler(handler)
 
-    def write(self, buf):
-        for line in buf.rstrip().splitlines():
-            self.logger.log(self.level, line.rstrip())
+# -----------------------------------------------------------------------------
+# Flask Application Setup
+# -----------------------------------------------------------------------------
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
-    def flush(self):
-        pass
+# CORS: Allow all origins for development
+CORS(
+    app,
+    resources={
+        r"/*": {
+            "origins": "*",
+            "methods": ["GET", "POST", "DELETE", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Accept", "X-Requested-With"],
+        }
+    },
+)
 
-sys.stdout = StreamToLogger(logger, logging.INFO)
-sys.stderr = StreamToLogger(logger, logging.ERROR)
+# -----------------------------------------------------------------------------
+# Receipt-specific OCR Text Cleaning
+# -----------------------------------------------------------------------------
+# Based on patterns from llm_notes/technologies_used.md
+OCR_CORRECTIONS = {
+    # Common receipt OCR errors
+    "Subtotai": "Subtotal",
+    "Totai": "Total",
+    "ltem": "Item",
+    "ltems": "Items",
+    "Qty": "Qty",
+    "QTy": "Qty",
+    "QTY": "Qty",
+    "Prlce": "Price",
+    "Arnount": "Amount",
+    "TAx": "Tax",
+    "TaX": "Tax",
+    "$0.00": "$0.00",  # Keep as-is
+}
 
-# --- Database Helpers ---
-def get_db_connection():
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        database=DB_NAME,
-        user=DB_USER,
-        password=DB_PASS
-    )
-    return conn
+# Regex patterns for price extraction
+PRICE_PATTERN = re.compile(r"\$?\d+[.,]\d{2}")
+QTY_PATTERN = re.compile(r"^\d+\s*[xX@]\s*")
+PATTERN_AMPERSAND = re.compile(r"(\w)&(\w)")
 
-def init_db():
-    """Initialize database schema on startup"""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS scans (
-                id SERIAL PRIMARY KEY,
-                filename VARCHAR(255) NOT NULL,
-                raw_text TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        conn.commit()
-        cur.close()
-        conn.close()
-        logging.info("[SYSTEM] Database initialized successfully.")
-    except Exception as e:
-        logging.error(f"[SYSTEM] Database init failed: {e}")
+# Regex-based corrections for spacing issues
+REGEX_CORRECTIONS: list[tuple[re.Pattern[str], str]] = [
+    # Number followed by common words without space
+    (re.compile(r"(\d)(Items?)\b", re.IGNORECASE), r"\1 \2"),
+    (re.compile(r"(\d)(Units?)\b", re.IGNORECASE), r"\1 \2"),
+    # Closing paren followed by capital letter without space
+    (re.compile(r"\)([A-Z][a-z]{2,})"), r") \1"),
+    # Lowercase followed by common words without space
+    (re.compile(r"([a-z])(Total)\b", re.IGNORECASE), r"\1 \2"),
+    (re.compile(r"([a-z])(Subtotal)\b", re.IGNORECASE), r"\1 \2"),
+    (re.compile(r"([a-z])(Tax)\b", re.IGNORECASE), r"\1 \2"),
+]
 
-# Initialize DB immediately
-init_db()
 
-# --- System Monitoring Thread ---
-def monitor_system():
-    """Background thread to push system stats to logs"""
-    while True:
+# Price pattern: matches $12.34, 12.34, etc.
+PRICE_PATTERN = re.compile(r"\$?\d+\.\d{2}")
+
+
+def clean_ocr_text(text: str) -> str:
+    """Apply OCR text cleaning based on llm_notes patterns."""
+    if not text:
+        return text
+    cleaned = text
+
+    # Step 1: Dictionary-based corrections
+    for wrong, correct in OCR_CORRECTIONS.items():
+        if wrong in cleaned:
+            cleaned = cleaned.replace(wrong, correct)
+
+    # Step 2: Regex-based corrections for spacing
+    for pattern, replacement in REGEX_CORRECTIONS:
+        cleaned = pattern.sub(replacement, cleaned)
+
+    # Step 3: Fix ampersand spacing: "word&word" -> "word & word"
+    cleaned = PATTERN_AMPERSAND.sub(r"\1 & \2", cleaned)
+
+    # Step 4: Normalize multiple spaces
+    cleaned = re.sub(r" {2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+def extract_price(text: str) -> float | None:
+    """Extract price from text string."""
+    match = PRICE_PATTERN.search(text)
+    if match:
+        price_str = match.group().replace("$", "").replace(",", "")
         try:
-            # 1. Basic Metrics
-            cpu = psutil.cpu_percent(interval=None)
-            mem = psutil.virtual_memory()
-            net = psutil.net_io_counters()
-            net_rx_mb = net.bytes_recv / (1024 * 1024)
-            
-            metric_msg = f"[METRIC] CPU: {cpu}% RAM: {mem.used//(1024*1024)}/{mem.total//(1024*1024)}MB NET_RX: {net_rx_mb:.1f}MB"
-            logger.info(metric_msg)
+            return float(price_str)
+        except ValueError:
+            return None
+    return None
 
-            # 2. Top Processes (mock 'top')
-            procs = []
-            for proc in psutil.process_iter(['pid', 'name', 'username', 'cpu_percent', 'memory_percent']):
+
+# -----------------------------------------------------------------------------
+# Database Functions
+# -----------------------------------------------------------------------------
+def get_db_connection() -> connection | None:
+    """Get PostgreSQL connection."""
+    try:
+        conn = psycopg2.connect(**DB_CONFIG, cursor_factory=RealDictCursor)  # type: ignore[call-overload]
+        return conn
+    except psycopg2.Error as e:
+        logger.error(f"Database connection failed: {e}")
+        return None
+
+
+def init_database() -> bool:
+    """Initialize database tables."""
+    conn = get_db_connection()
+    if not conn:
+        logger.warning("Could not connect to PostgreSQL - database features disabled")
+        return False
+
+    try:
+        with conn.cursor() as cur:
+            # Simple schema: just store filename, raw OCR text, and timestamp
+            # No receipt-specific fields - this is a general-purpose OCR tool
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS scans (
+                    id SERIAL PRIMARY KEY,
+                    filename VARCHAR(255),
+                    raw_text TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            conn.commit()
+        logger.info("Database tables initialized successfully")
+        return True
+    except psycopg2.Error as e:
+        logger.error(f"Database initialization failed: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+# -----------------------------------------------------------------------------
+# PaddleOCR Engine - based on llm_notes/technologies_used.md
+# -----------------------------------------------------------------------------
+def init_ocr_engine() -> PaddleOCR | None:
+    """Initialize PaddleOCR with CPU-optimized settings."""
+    try:
+        # New PaddleOCR API (v3+)
+        engine = PaddleOCR(
+            lang="en",
+            use_doc_orientation_classify=False,  # Rotation handled elsewhere
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            text_det_limit_side_len=2560,
+            text_det_limit_type="max",
+            text_det_thresh=0.3,
+            text_det_box_thresh=0.5,
+        )
+        logger.info("PaddleOCR initialized successfully")
+        return engine
+    except Exception as e:
+        logger.exception(f"Failed to initialize PaddleOCR: {e}")
+        return None
+
+
+ocr = init_ocr_engine()
+
+# Initialize database at module load (for gunicorn which imports module, not runs __main__)
+init_database()
+
+
+# -----------------------------------------------------------------------------
+# Real-Time System Monitoring During OCR
+# -----------------------------------------------------------------------------
+def monitor_ocr_process(stop_event: threading.Event, pixel_count: int, ocr_start_time: float) -> None:
+    """
+    Background thread that monitors system activity during OCR processing.
+    Uses native Linux tools (ps, lsof, /proc) to show REAL system data.
+
+    Args:
+        stop_event: Threading event to signal when to stop monitoring
+        pixel_count: Number of pixels being processed (for progress estimation)
+        ocr_start_time: When OCR processing started (for elapsed time)
+    """
+    import time
+
+    # Get the current process PID
+    pid = os.getpid()
+
+    # Track previous CPU time for calculating CPU percentage
+    prev_cpu_time = 0
+    prev_timestamp = time.time()
+
+    while not stop_event.is_set():
+        try:
+            elapsed = time.time() - ocr_start_time
+            current_timestamp = time.time()
+
+            # 1. CPU and Memory from /proc (fastest, no external process)
+            try:
+                with open(f"/proc/{pid}/stat", "r") as f:
+                    stat = f.read().split()
+                    # utime (14) + stime (15) = CPU time in clock ticks (index 13, 14 in 0-based)
+                    utime = int(stat[13])
+                    stime = int(stat[14])
+                    total_cpu_time = utime + stime
+
+                    # Calculate CPU percentage
+                    cpu_delta = total_cpu_time - prev_cpu_time
+                    time_delta = current_timestamp - prev_timestamp
+                    # Convert clock ticks to seconds (100 ticks per second on most systems)
+                    cpu_percent = (cpu_delta / 100.0) / time_delta * 100 if time_delta > 0 else 0
+                    prev_cpu_time = total_cpu_time
+                    prev_timestamp = current_timestamp
+
+                with open(f"/proc/{pid}/status", "r") as f:
+                    status_lines = f.readlines()
+                    vm_rss = 0
+                    vm_size = 0
+                    threads = 0
+                    for line in status_lines:
+                        if line.startswith("VmRSS:"):
+                            # VmRSS is in kB (actual physical memory used)
+                            vm_rss = int(line.split()[1]) // 1024  # Convert to MB
+                        elif line.startswith("VmSize:"):
+                            # VmSize is in kB (total virtual memory)
+                            vm_size = int(line.split()[1]) // 1024  # Convert to MB
+                        elif line.startswith("Threads:"):
+                            threads = int(line.split()[1])
+
+                logger.info(f"[REAL DATA] {elapsed:.1f}s | CPU: {cpu_percent:.1f}% | RAM: {vm_rss}MB (VmSize: {vm_size}MB) | Threads: {threads}")
+
+            except Exception as e:
+                logger.debug(f"Failed to read /proc: {e}")
+
+            # 2. Disk I/O from /proc/[pid]/io (shows actual bytes read/written)
+            try:
+                with open(f"/proc/{pid}/io", "r") as f:
+                    io_lines = f.readlines()
+                    read_bytes = 0
+                    write_bytes = 0
+                    for line in io_lines:
+                        if line.startswith("read_bytes:"):
+                            read_bytes = int(line.split()[1]) // (1024 * 1024)  # MB
+                        elif line.startswith("write_bytes:"):
+                            write_bytes = int(line.split()[1]) // (1024 * 1024)  # MB
+
+                    if read_bytes > 0 or write_bytes > 0:
+                        logger.info(f"[REAL DATA] Disk I/O: {read_bytes}MB read, {write_bytes}MB written")
+
+            except Exception as e:
+                logger.debug(f"Failed to read I/O stats: {e}")
+
+            # 3. Open file descriptors and network connections (only check every 10 seconds to reduce overhead)
+            if int(elapsed) % 10 == 0:
                 try:
-                    pinfo = proc.info
-                    # Filter for relevant processes
-                    if pinfo['cpu_percent'] > 0.0 or 'python' in pinfo['name'] or 'gunicorn' in pinfo['name']:
-                        procs.append(pinfo)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            
-            # Sort by CPU usage
-            procs.sort(key=lambda x: x['cpu_percent'], reverse=True)
-            top_procs = procs[:5] # Top 5
-            
-            logger.info(f"[TOP] {json.dumps(top_procs)}")
-            
-            time.sleep(2) 
-        except Exception as e:
+                    result = subprocess.run(
+                        ["lsof", "-p", str(pid)],
+                        capture_output=True,
+                        text=True,
+                        timeout=2
+                    )
+                    if result.returncode == 0:
+                        lines = result.stdout.split("\n")
+                        # Count .pdparams and .pdiparams files (PaddleOCR model files)
+                        model_files = [l for l in lines if ".pdparams" in l or ".pdiparams" in l]
+                        # Count open regular files
+                        reg_files = [l for l in lines if " REG " in l]
+                        # Count network connections
+                        net_conns = [l for l in lines if " IPv4 " in l or " IPv6 " in l]
+
+                        if model_files:
+                            logger.info(f"[REAL DATA] {len(model_files)} model files | {len(reg_files)} files open | {len(net_conns)} network connections")
+                except Exception as e:
+                    logger.debug(f"lsof failed: {e}")
+
+            # 4. System-wide load average
+            try:
+                with open("/proc/loadavg", "r") as f:
+                    loadavg = f.read().split()
+                    # loadavg[0] = 1-minute average, [1] = 5-minute, [2] = 15-minute
+                    logger.info(f"[REAL DATA] System load: {loadavg[0]} (1min), {loadavg[1]} (5min)")
+            except Exception as e:
+                logger.debug(f"Failed to read loadavg: {e}")
+
+            # Sleep for 5 seconds before next check (reduced from 3s to optimize resource usage)
             time.sleep(5)
 
-# Start Monitor
-monitor_thread = threading.Thread(target=monitor_system, daemon=True)
-monitor_thread.start()
-
-# --- Routes ---
-
-@app.route('/health', methods=['GET'])
-def health():
-    try:
-        mem = psutil.virtual_memory()
-        return jsonify({
-            'status': 'online',
-            'cpu_percent': psutil.cpu_percent(),
-            'memory_used': mem.used / (1024 * 1024),
-            'memory_total': mem.total / (1024 * 1024)
-        })
-    except Exception as e:
-        return jsonify({'status': 'error', 'msg': str(e)}), 500
-
-@app.route('/logs/stream')
-def stream_logs():
-    def generate():
-        while True:
-            try:
-                # Get log from queue, wait up to 1s
-                msg_data = log_queue.get(timeout=1.0)
-                yield f"data: {msg_data}\n\n"
-            except queue.Empty:
-                # Send heartbeat to keep connection alive
-                yield ": heartbeat\n\n"
-            except GeneratorExit:
-                break
-    return Response(stream_with_context(generate()), mimetype='text/event-stream')
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-@app.route('/ocr', methods=['POST'])
-def run_ocr():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
-    
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-        
-    if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
-        
-        logging.info(f"[OCR INFO] Processing file: {filename}")
-        
-        try:
-            # Pass a callback to push specific OCR progress updates
-            def progress_callback(msg):
-                logging.info(f"[OCR INFO] {msg}")
-
-            result = process_image(filepath, log_callback=progress_callback)
-            
-            # Save to DB
-            try:
-                conn = get_db_connection()
-                cur = conn.cursor()
-                cur.execute(
-                    "INSERT INTO scans (filename, raw_text) VALUES (%s, %s) RETURNING id",
-                    (filename, result['raw_text'])
-                )
-                scan_id = cur.fetchone()[0]
-                conn.commit()
-                cur.close()
-                conn.close()
-                result['db_id'] = scan_id
-                logging.info(f"[OCR INFO] Saved to database ID: {scan_id}")
-            except Exception as e:
-                logging.error(f"[ERROR] DB Save failed: {e}")
-
-            return jsonify(result)
-        
         except Exception as e:
-            logging.error(f"[ERROR] OCR Processing Failed: {str(e)}")
-            return jsonify({'error': str(e)}), 500
-            
-    return jsonify({'error': 'File type not allowed'}), 400
+            logger.error(f"Monitoring thread error: {e}")
+            break
 
-@app.route('/scans', methods=['GET'])
-def list_scans():
+
+# -----------------------------------------------------------------------------
+# OCR Text Parsing Logic
+# -----------------------------------------------------------------------------
+def parse_receipt_text(blocks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Parse OCR blocks into structured data.
+
+    Now generic - captures all text lines as items, not just those with prices.
+    This works for receipts, invoices, bid sheets, or any document.
+    """
+    items: list[dict[str, Any]] = []
+    subtotal: float | None = None
+    tax: float | None = None
+    total: float | None = None
+    store_name: str | None = None
+
+    # Sort blocks by Y position (top to bottom)
+    sorted_blocks = sorted(blocks, key=lambda b: b.get("_y", 0))
+
+    # Keywords to exclude from items (metadata, not content)
+    exclude_keywords = ["subtotal", "tax", "total", "change", "cash", "card", "credit", "debit"]
+
+    # Minimum text length to be considered an item (filter noise)
+    MIN_ITEM_LENGTH = 3
+
+    for block in sorted_blocks:
+        text = clean_ocr_text(block.get("text", ""))
+        text_lower = text.lower()
+        price = extract_price(text)
+
+        # Skip very short text (likely noise or single characters)
+        if len(text.strip()) < MIN_ITEM_LENGTH:
+            continue
+
+        # Detect totals (receipt-specific, but keep for backwards compatibility)
+        if "subtotal" in text_lower and price:
+            subtotal = price
+        elif "tax" in text_lower and price:
+            tax = price
+        elif "total" in text_lower and "subtotal" not in text_lower and price:
+            total = price
+        elif text and not any(x in text_lower for x in exclude_keywords):
+            # Capture as item - with or without price
+            # Remove price from text to get item name
+            item_name = PRICE_PATTERN.sub("", text).strip()
+            if item_name and len(item_name) >= MIN_ITEM_LENGTH:
+                items.append(
+                    {
+                        "name": item_name,
+                        "quantity": 1,
+                        "unit_price": price,  # May be None
+                        "total_price": price,  # May be None
+                    }
+                )
+
+    # Use first non-price item as potential header/title (optional)
+    if items and not store_name:
+        store_name = items[0]["name"] if len(items) > 0 else None
+
+    return {
+        "store_name": store_name,
+        "items": items,
+        "subtotal": subtotal,
+        "tax": tax,
+        "total": total,
+    }
+
+
+# -----------------------------------------------------------------------------
+# API Routes
+# -----------------------------------------------------------------------------
+# Backend version - increment when making breaking changes
+BACKEND_VERSION = "1.0.0"
+
+
+@app.route("/health", methods=["GET"])
+def health() -> Response:
+    """Health check endpoint."""
+    db_status = "connected" if get_db_connection() else "disconnected"
+    return jsonify(
+        {
+            "status": "healthy",
+            "version": BACKEND_VERSION,
+            "ocr_engine": "ready" if ocr else "not_initialized",
+            "database": db_status,
+        }
+    )
+
+
+@app.route("/network-diagnostics", methods=["GET"])
+def network_diagnostics() -> Response:
+    """Network diagnostics to help users troubleshoot connectivity issues."""
+    diagnostics: dict[str, Any] = {
+        "ports": {},
+        "firewall": {},
+        "local_ips": [],
+        "instructions": [],
+    }
+
+    # Get local IP addresses
     try:
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT * FROM scans ORDER BY created_at DESC LIMIT 50")
-        scans = cur.fetchall()
-        cur.close()
-        conn.close()
-        return jsonify({'scans': scans})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        result = subprocess.run(
+            ["hostname", "-I"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            diagnostics["local_ips"] = result.stdout.strip().split()
+    except Exception:
+        pass
 
-@app.route('/scans/<int:scan_id>', methods=['DELETE'])
-def delete_scan(scan_id):
+    # Check port listening status
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM scans WHERE id = %s", (scan_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        result = subprocess.run(
+            ["ss", "-tlnp"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            lines = result.stdout
+            diagnostics["ports"]["5173"] = {
+                "listening": ":5173" in lines,
+                "all_interfaces": "0.0.0.0:5173" in lines or "*:5173" in lines,
+            }
+            diagnostics["ports"]["5001"] = {
+                "listening": ":5001" in lines,
+                "all_interfaces": "0.0.0.0:5001" in lines,
+            }
+    except Exception:
+        pass
 
-if __name__ == '__main__':
-    # Use threaded=True for dev server to support SSE + processing
-    app.run(host='0.0.0.0', port=5001, debug=True, threaded=True)
+    # Check firewall status
+    firewall_type = None
+    firewall_active = False
+
+    # Check ufw
+    try:
+        result = subprocess.run(
+            ["ufw", "status"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            firewall_type = "ufw"
+            firewall_active = "Status: active" in result.stdout
+            diagnostics["firewall"] = {
+                "type": "ufw",
+                "active": firewall_active,
+                "command": "sudo ufw allow 5173/tcp && sudo ufw allow 5001/tcp",
+            }
+    except FileNotFoundError:
+        pass
+
+    # Check firewalld if ufw not found
+    if not firewall_type:
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", "firewalld"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                firewall_type = "firewalld"
+                firewall_active = True
+                fw_cmd = (
+                    "sudo firewall-cmd --add-port=5173/tcp "
+                    "--add-port=5001/tcp --permanent && "
+                    "sudo firewall-cmd --reload"
+                )
+                diagnostics["firewall"] = {
+                    "type": "firewalld",
+                    "active": True,
+                    "command": fw_cmd,
+                }
+        except FileNotFoundError:
+            pass
+
+    # Check iptables for blocking rules
+    if not firewall_type:
+        try:
+            result = subprocess.run(
+                ["iptables", "-L", "INPUT", "-n"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            has_drop = "DROP" in result.stdout or "REJECT" in result.stdout
+            if result.returncode == 0 and has_drop:
+                ipt_cmd = (
+                    "sudo iptables -I INPUT -p tcp --dport 5173 -j ACCEPT && "
+                    "sudo iptables -I INPUT -p tcp --dport 5001 -j ACCEPT"
+                )
+                diagnostics["firewall"] = {
+                    "type": "iptables",
+                    "active": True,
+                    "command": ipt_cmd,
+                }
+        except FileNotFoundError:
+            pass
+
+    if not diagnostics["firewall"]:
+        diagnostics["firewall"] = {"type": "none", "active": False}
+
+    # Build troubleshooting instructions
+    instructions = []
+
+    if not diagnostics["ports"].get("5173", {}).get("listening"):
+        instructions.append(
+            {
+                "issue": "Frontend not running",
+                "fix": "Start the dev server: npm run dev",
+            }
+        )
+
+    if not diagnostics["ports"].get("5001", {}).get("listening"):
+        instructions.append(
+            {
+                "issue": "Backend not running",
+                "fix": "Start backend: docker compose up -d",
+            }
+        )
+
+    if diagnostics["firewall"].get("active"):
+        instructions.append(
+            {
+                "issue": f"Firewall ({diagnostics['firewall']['type']}) may block connections",
+                "fix": diagnostics["firewall"]["command"],
+            }
+        )
+
+    diagnostics["instructions"] = instructions
+    diagnostics["network_url"] = (
+        f"http://{diagnostics['local_ips'][0]}:5173" if diagnostics["local_ips"] else None
+    )
+
+    return jsonify(diagnostics)
+
+
+@app.route("/stats", methods=["GET"])
+def get_stats() -> tuple[Response, int] | Response:
+    """Get database statistics - scan count, dates, etc."""
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Database not available"}), 503
+
+    try:
+        with conn.cursor() as cur:
+            # Get scan count and date range
+            cur.execute("""
+                SELECT
+                    COUNT(*) as scan_count,
+                    MIN(created_at) as oldest,
+                    MAX(created_at) as newest
+                FROM scans
+            """)
+            stats = cur.fetchone()
+
+        # Convert RealDictRow to dict for mypy
+        stats_dict: dict[str, Any] = dict(stats) if stats else {}
+        oldest = stats_dict.get("oldest")
+        newest = stats_dict.get("newest")
+        return jsonify(
+            {
+                "scan_count": stats_dict.get("scan_count", 0),
+                "oldest_scan": oldest.isoformat() if oldest else None,
+                "newest_scan": newest.isoformat() if newest else None,
+                "database": "PostgreSQL",
+                "status": "connected",
+            }
+        )
+    except psycopg2.Error as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/scans/export", methods=["GET"])
+def export_scans() -> tuple[Response, int] | Response:
+    """Export all scans as JSON or CSV."""
+    export_format = request.args.get("format", "json").lower()
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Database not available"}), 503
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, filename, raw_text, created_at
+                FROM scans ORDER BY created_at DESC
+            """)
+            scans = cur.fetchall()
+
+        # Convert RealDictRow to dict for mypy
+        scan_list: list[dict[str, Any]] = [dict(s) for s in scans]
+
+        if export_format == "csv":
+            import csv
+            import io
+
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["ID", "Filename", "Raw Text", "Created"])
+            for s in scan_list:
+                writer.writerow([s["id"], s["filename"], s["raw_text"], s["created_at"]])
+            response = Response(output.getvalue(), mimetype="text/csv")
+            response.headers["Content-Disposition"] = "attachment; filename=scans_export.csv"
+            return response
+        else:
+            # JSON format - convert to serializable format
+            result = []
+            for s in scan_list:
+                created = s["created_at"]
+                result.append(
+                    {
+                        "id": s["id"],
+                        "filename": s["filename"],
+                        "raw_text": s["raw_text"],
+                        "created_at": created.isoformat() if created else None,
+                    }
+                )
+            response = Response(json_module.dumps(result, indent=2), mimetype="application/json")
+            response.headers["Content-Disposition"] = "attachment; filename=scans_export.json"
+            return response
+    except psycopg2.Error as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/logs", methods=["GET"])
+def get_logs() -> Response:
+    """
+    Get recent backend logs for frontend display.
+
+    Returns logs since 'since' timestamp (query param).
+    This enables the frontend to poll for new logs during OCR processing.
+    """
+    since = request.args.get("since", 0.0, type=float)
+
+    with log_buffer_lock:
+        logs = [log for log in log_buffer if log["timestamp"] > since]
+
+    return jsonify({"logs": logs, "timestamp": time_module.time()})
+
+
+@app.route("/logs/stream", methods=["GET"])
+def stream_logs() -> Response:
+    """
+    Server-Sent Events endpoint for real-time log streaming.
+
+    Frontend connects to this endpoint and receives logs as they happen.
+    """
+
+    def generate() -> Any:
+        last_sent = time_module.time()
+        while True:
+            with log_buffer_lock:
+                new_logs = [log for log in log_buffer if log["timestamp"] > last_sent]
+            for log in new_logs:
+                data = json_module.dumps(log)
+                yield f"data: {data}\n\n"
+                last_sent = log["timestamp"]
+            time_module.sleep(0.5)  # Poll every 500ms
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
+@app.route("/ocr", methods=["POST"])
+def ocr_endpoint() -> tuple[Response, int] | Response:
+    """Process receipt image and return OCR results."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    if not file or file.filename == "":
+        return jsonify({"error": "No file selected"}), 400
+
+    if not ocr:
+        return jsonify({"error": "OCR engine not initialized"}), 503
+
+    try:
+        # Read image
+        file_bytes = file.read()
+        nparr = np.frombuffer(file_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if img is None:
+            return jsonify({"error": "Invalid image file"}), 400
+
+        import time
+
+        start_time = time.time()
+
+        file_size_kb = len(file_bytes) / 1024
+        logger.info(f"Processing receipt: {file.filename} ({file_size_kb:.1f} KB)")
+
+        # Preprocess image with OpenCV for better OCR accuracy
+        preprocess_start = time.time()
+        preprocessed = preprocess_for_ocr(img)
+        preprocess_time = time.time() - preprocess_start
+        logger.info(
+            f"OpenCV preprocessing complete ({preprocess_time:.1f}s): denoise, CLAHE, deskew"
+        )
+
+        # Run OCR on preprocessed image (new PaddleOCR v3+ API)
+        # This is the slowest step - typically 30-90 seconds for large images on CPU
+        img_h, img_w = preprocessed.shape[:2] if len(preprocessed.shape) >= 2 else (0, 0)
+        pixel_count = img_w * img_h
+        estimated_seconds = max(10, int(pixel_count / 400000))  # ~400k pixels/sec on CPU
+
+        logger.info(
+            f"[OCR] Starting text detection on {img_w}x{img_h} image ({pixel_count:,} pixels)"
+        )
+        logger.info(f"[OCR] Estimated time: ~{estimated_seconds}s (CPU inference, no GPU)")
+        logger.info("[OCR] Step 1/3: Text detection - finding text regions...")
+
+        # Start real-time monitoring thread
+        # This will display ACTUAL system data (RAM, threads, disk I/O) every 3 seconds
+        # while PaddleOCR is processing
+        stop_monitoring = threading.Event()
+        ocr_start = time.time()
+
+        monitor_thread = threading.Thread(
+            target=monitor_ocr_process,
+            args=(stop_monitoring, pixel_count, ocr_start),
+            daemon=True
+        )
+        monitor_thread.start()
+
+        # PaddleOCR C++ detection engine runs here (silent, no logs from C++)
+        # The monitoring thread will show REAL system activity during this time
+        result = ocr.predict(preprocessed)
+        ocr_time = time.time() - ocr_start
+
+        # Stop monitoring thread
+        stop_monitoring.set()
+        monitor_thread.join(timeout=1)
+
+        logger.info("[OCR] Step 2/3: Text recognition - complete")
+        logger.info("[OCR] Step 3/3: Post-processing - complete")
+        logger.info(f"[OCR] Inference finished in {ocr_time:.1f}s")
+
+        if not result or len(result) == 0:
+            return jsonify({"error": "No text detected"}), 200
+
+        # New API returns list of dicts with 'rec_texts', 'rec_scores', 'dt_polys'
+        ocr_result = result[0]
+        rec_texts = ocr_result.get("rec_texts", [])
+        rec_scores = ocr_result.get("rec_scores", [])
+        dt_polys = ocr_result.get("dt_polys", [])
+
+        if not rec_texts:
+            return jsonify({"error": "No text detected"}), 200
+
+        total_time = time.time() - start_time
+        logger.info(f"Detected {len(rec_texts)} text blocks (total: {total_time:.1f}s)")
+
+        # Extract blocks with coordinates
+        blocks = []
+        raw_lines = []
+
+        for i, text in enumerate(rec_texts):
+            confidence = rec_scores[i] if i < len(rec_scores) else 0.0
+            bbox = dt_polys[i] if i < len(dt_polys) else [[0, 0], [0, 0], [0, 0], [0, 0]]
+
+            x_coords = [p[0] for p in bbox]
+            y_coords = [p[1] for p in bbox]
+
+            blocks.append(
+                {
+                    "text": text,
+                    "confidence": float(confidence),
+                    "_x": float(min(x_coords)),
+                    "_y": float(min(y_coords)),
+                    "_w": float(max(x_coords) - min(x_coords)),
+                    "_h": float(max(y_coords) - min(y_coords)),
+                }
+            )
+            raw_lines.append(text)
+
+        # Analyze layout - detect columns, rows, spacing
+        layout = analyze_layout_column_first(blocks)
+        logger.info(f"Layout: {layout['column_count']} columns, {layout['row_count']} rows")
+
+        # Use layout-aware text reconstruction if multi-column
+        raw_text = layout["raw_text"] if layout["column_count"] > 1 else "\n".join(raw_lines)
+
+        # Parse receipt structure
+        parsed = parse_receipt_text(blocks)
+
+        return jsonify(
+            {
+                "success": True,
+                "filename": file.filename,
+                "blocks": blocks,
+                "raw_text": raw_text,
+                "parsed": parsed,
+                "layout": {
+                    "column_count": layout["column_count"],
+                    "row_count": layout["row_count"],
+                },
+            }
+        )
+
+    except Exception as e:
+        logger.exception(f"OCR processing failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/ocr/hybrid", methods=["POST"])
+def hybrid_ocr_endpoint() -> tuple[Response, int] | Response:
+    """
+    Hybrid OCR endpoint: Tesseract (fast) → PaddleOCR (accurate) cascade.
+
+    Strategy:
+    1. Try Tesseract first (5-8 seconds, PSM 6)
+    2. If Tesseract confidence >= 0.85, return immediately
+    3. If confidence < 0.85, fall back to PaddleOCR (60-90 seconds)
+
+    This provides ~15 second average response time vs 60-90 seconds PaddleOCR-only.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    if not file or file.filename == "":
+        return jsonify({"error": "No file selected"}), 400
+
+    if not ocr:
+        return jsonify({"error": "OCR engine not initialized"}), 503
+
+    try:
+        import time
+
+        start_time = time.time()
+
+        # Read image
+        file_bytes = file.read()
+        nparr = np.frombuffer(file_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if img is None:
+            return jsonify({"error": "Invalid image file"}), 400
+
+        file_size_kb = len(file_bytes) / 1024
+        logger.info(f"[HYBRID] Processing: {file.filename} ({file_size_kb:.1f} KB)")
+
+        # Preprocess image
+        preprocess_start = time.time()
+        preprocessed = preprocess_for_ocr(img)
+        preprocess_time = time.time() - preprocess_start
+        logger.info(f"[HYBRID] Preprocessing complete ({preprocess_time:.1f}s)")
+
+        # STEP 1: Try Tesseract first (fast engine)
+        logger.info("[HYBRID] Step 1/2: Trying Tesseract OCR (fast, 5-8s)...")
+        tesseract_start = time.time()
+
+        try:
+            # Use Tesseract with PSM 6 (uniform block of text) and OEM 1 (LSTM)
+            tesseract_data = pytesseract.image_to_data(
+                preprocessed,
+                config='--psm 6 --oem 1',
+                output_type=pytesseract.Output.DICT
+            )
+
+            tesseract_time = time.time() - tesseract_start
+
+            # Extract text and calculate average confidence
+            texts = []
+            confidences = []
+            blocks = []
+
+            for i in range(len(tesseract_data['text'])):
+                text = tesseract_data['text'][i].strip()
+                conf = int(tesseract_data['conf'][i])
+
+                if text and conf > 0:  # Filter out empty and low-confidence
+                    texts.append(text)
+                    confidences.append(conf / 100.0)  # Convert to 0-1 range
+
+                    # Build block structure
+                    blocks.append({
+                        'text': text,
+                        'confidence': conf / 100.0,
+                        '_x': float(tesseract_data['left'][i]),
+                        '_y': float(tesseract_data['top'][i]),
+                        '_w': float(tesseract_data['width'][i]),
+                        '_h': float(tesseract_data['height'][i]),
+                    })
+
+            avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+
+            logger.info(f"[HYBRID] Tesseract complete ({tesseract_time:.1f}s): {len(texts)} blocks, avg confidence: {avg_confidence:.2f}")
+
+            # Store Tesseract result for later (will be included in response even if we use PaddleOCR)
+            tesseract_result = {
+                'engine': 'tesseract',
+                'confidence': avg_confidence,
+                'processing_time': tesseract_time,
+                'blocks': blocks,
+                'raw_text': "\n".join(texts),
+                'block_count': len(blocks)
+            }
+
+            # DECISION: Use Tesseract result if confidence >= 0.85
+            CONFIDENCE_THRESHOLD = 0.85
+
+            if avg_confidence >= CONFIDENCE_THRESHOLD:
+                logger.info(f"[HYBRID] ✓ Tesseract confidence {avg_confidence:.2f} >= {CONFIDENCE_THRESHOLD}, using Tesseract result")
+
+                raw_text = "\n".join(texts)
+                layout = analyze_layout_column_first(blocks)
+                parsed = parse_receipt_text(blocks)
+
+                total_time = time.time() - start_time
+
+                return jsonify({
+                    'success': True,
+                    'filename': file.filename,
+                    'engine': 'tesseract',
+                    'confidence': avg_confidence,
+                    'processing_time': total_time,
+                    'blocks': blocks,
+                    'raw_text': raw_text,
+                    'parsed': parsed,
+                    'layout': {
+                        'column_count': layout['column_count'],
+                        'row_count': layout['row_count'],
+                    },
+                    'tesseract_result': tesseract_result  # Include Tesseract data
+                })
+            else:
+                logger.info(f"[HYBRID] ✗ Tesseract confidence {avg_confidence:.2f} < {CONFIDENCE_THRESHOLD}, falling back to PaddleOCR")
+
+        except Exception as e:
+            logger.warning(f"[HYBRID] Tesseract failed: {e}, falling back to PaddleOCR")
+            tesseract_result = None  # No Tesseract result available
+
+        # STEP 2: Fall back to PaddleOCR (accurate but slow)
+        logger.info("[HYBRID] Step 2/2: Using PaddleOCR (accurate, 60-90s)...")
+
+        img_h, img_w = preprocessed.shape[:2] if len(preprocessed.shape) >= 2 else (0, 0)
+        pixel_count = img_w * img_h
+        estimated_seconds = max(10, int(pixel_count / 400000))
+
+        logger.info(f"[OCR] Starting text detection on {img_w}x{img_h} image ({pixel_count:,} pixels)")
+        logger.info(f"[OCR] Estimated time: ~{estimated_seconds}s (CPU inference, no GPU)")
+
+        # Start real-time monitoring thread for PaddleOCR
+        stop_monitoring = threading.Event()
+        ocr_start = time.time()
+
+        monitor_thread = threading.Thread(
+            target=monitor_ocr_process,
+            args=(stop_monitoring, pixel_count, ocr_start),
+            daemon=True
+        )
+        monitor_thread.start()
+
+        # PaddleOCR processing (silent C++ engine)
+        result = ocr.predict(preprocessed)
+        ocr_time = time.time() - ocr_start
+
+        # Stop monitoring
+        stop_monitoring.set()
+        monitor_thread.join(timeout=1)
+
+        logger.info(f"[OCR] Inference finished in {ocr_time:.1f}s")
+
+        if not result or len(result) == 0:
+            return jsonify({"error": "No text detected"}), 200
+
+        # Parse PaddleOCR result
+        ocr_result = result[0]
+        rec_texts = ocr_result.get("rec_texts", [])
+        rec_scores = ocr_result.get("rec_scores", [])
+        dt_polys = ocr_result.get("dt_polys", [])
+
+        if not rec_texts:
+            return jsonify({"error": "No text detected"}), 200
+
+        total_time = time.time() - start_time
+        logger.info(f"[HYBRID] PaddleOCR complete: {len(rec_texts)} blocks (total: {total_time:.1f}s)")
+
+        # Build blocks
+        blocks = []
+        raw_lines = []
+
+        for i, text in enumerate(rec_texts):
+            confidence = rec_scores[i] if i < len(rec_scores) else 0.0
+            bbox = dt_polys[i] if i < len(dt_polys) else [[0, 0], [0, 0], [0, 0], [0, 0]]
+
+            x_coords = [p[0] for p in bbox]
+            y_coords = [p[1] for p in bbox]
+
+            blocks.append({
+                "text": text,
+                "confidence": float(confidence),
+                "_x": float(min(x_coords)),
+                "_y": float(min(y_coords)),
+                "_w": float(max(x_coords) - min(x_coords)),
+                "_h": float(max(y_coords) - min(y_coords)),
+            })
+            raw_lines.append(text)
+
+        layout = analyze_layout_column_first(blocks)
+        raw_text = layout["raw_text"] if layout["column_count"] > 1 else "\n".join(raw_lines)
+        parsed = parse_receipt_text(blocks)
+
+        avg_confidence = sum(rec_scores) / len(rec_scores) if rec_scores else 0.0
+
+        response_data = {
+            'success': True,
+            'filename': file.filename,
+            'engine': 'paddleocr',
+            'confidence': avg_confidence,
+            'processing_time': total_time,
+            'blocks': blocks,
+            'raw_text': raw_text,
+            'parsed': parsed,
+            'layout': {
+                'column_count': layout['column_count'],
+                'row_count': layout['row_count'],
+            }
+        }
+
+        # Include Tesseract result if available (so user can see both results)
+        if 'tesseract_result' in locals() and tesseract_result is not None:
+            response_data['tesseract_result'] = tesseract_result
+            logger.info(f"[HYBRID] Including Tesseract result in response (confidence: {tesseract_result['confidence']:.2f})")
+
+        return jsonify(response_data)
+
+    except Exception as e:
+        logger.exception(f"[HYBRID] OCR processing failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/detect-rotation", methods=["POST"])
+def detect_rotation() -> tuple[Response, int] | Response:
+    """
+    Detect image orientation using Tesseract OSD.
+
+    Request: JSON with 'image' field containing base64-encoded image data
+    Response: JSON with orientation, confidence, and correction angle
+    """
+    try:
+        logger.info("Rotation detection request received")
+
+        data = request.get_json()
+        if not data or "image" not in data:
+            return jsonify({"error": "No image data provided"}), 400
+
+        # Extract base64 image data
+        image_data = data["image"]
+
+        # Remove data URL prefix if present
+        if "," in image_data:
+            image_data = image_data.split(",")[1]
+
+        # Decode base64
+        img_bytes = base64.b64decode(image_data)
+        logger.info(f"Decoded {len(img_bytes)} bytes for rotation detection")
+
+        # Save to temporary file for Tesseract
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp.write(img_bytes)
+            tmp_path = tmp.name
+
+        try:
+            # Run Tesseract OSD (Orientation and Script Detection)
+            logger.info("Running Tesseract OSD...")
+            result = subprocess.run(
+                ["tesseract", tmp_path, "stdout", "--psm", "0"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            osd_output = result.stdout
+            logger.info(f"Tesseract OSD output: {osd_output[:200] if osd_output else 'empty'}")
+
+            # Parse orientation from OSD output
+            orientation = 0
+            rotate = 0
+            confidence = 0.0
+            script = "Unknown"
+
+            for line in osd_output.split("\n"):
+                if "Orientation in degrees:" in line:
+                    orientation = int(line.split(":")[1].strip())
+                elif "Rotate:" in line:
+                    rotate = int(line.split(":")[1].strip())
+                elif "Orientation confidence:" in line:
+                    confidence = float(line.split(":")[1].strip())
+                elif "Script:" in line:
+                    script = line.split(":")[1].strip()
+
+            logger.info(
+                "Detected: orientation=%d°, rotate=%d°, confidence=%.2f",
+                orientation,
+                rotate,
+                confidence,
+            )
+
+            return jsonify(
+                {
+                    "success": True,
+                    "orientation": orientation,
+                    "rotate": rotate,
+                    "confidence": confidence,
+                    "script": script,
+                    "raw_output": osd_output,
+                }
+            )
+
+        finally:
+            # Clean up temp file
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    except subprocess.TimeoutExpired:
+        logger.error("Tesseract OSD timed out")
+        return jsonify({"error": "Tesseract OSD timed out"}), 500
+    except FileNotFoundError:
+        logger.error("Tesseract not installed")
+        return jsonify(
+            {
+                "error": "Tesseract not installed in container",
+                "success": False,
+                "orientation": 0,
+                "confidence": 0,
+            }
+        ), 503
+    except Exception as e:
+        logger.exception(f"Rotation detection failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/scans", methods=["GET"])
+def list_scans() -> tuple[Response, int] | Response:
+    """List all saved scans."""
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Database not available"}), 503
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, filename, raw_text, created_at
+                FROM scans ORDER BY created_at DESC
+            """)
+            scans = cur.fetchall()
+        return jsonify({"scans": [dict(s) for s in scans]})
+    except psycopg2.Error as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/scans", methods=["POST"])
+def save_scan() -> tuple[Response, int] | Response:
+    """Save a scan to the database."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Database not available"}), 503
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO scans (filename, raw_text)
+                VALUES (%s, %s)
+                RETURNING id
+                """,
+                (data.get("filename"), data.get("raw_text")),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("Failed to insert scan")
+            scan_id = row["id"]  # type: ignore[call-overload]
+            conn.commit()
+
+        return jsonify({"success": True, "scan_id": scan_id})
+    except psycopg2.Error as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/scans/<int:scan_id>", methods=["GET"])
+def get_scan(scan_id: int) -> tuple[Response, int] | Response:
+    """Get a specific scan."""
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Database not available"}), 503
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM scans WHERE id = %s", (scan_id,))
+            scan = cur.fetchone()
+
+            if not scan:
+                return jsonify({"error": "Scan not found"}), 404
+
+        return jsonify(dict(scan))
+    except psycopg2.Error as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/scans/<int:scan_id>", methods=["DELETE"])
+def delete_scan(scan_id: int) -> tuple[Response, int] | Response:
+    """Delete a scan."""
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Database not available"}), 503
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM scans WHERE id = %s RETURNING id", (scan_id,))
+            deleted = cur.fetchone()
+            conn.commit()
+
+        if not deleted:
+            return jsonify({"error": "Scan not found"}), 404
+
+        return jsonify({"success": True})
+    except psycopg2.Error as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/scans/clear", methods=["DELETE"])
+def clear_all_scans() -> tuple[Response, int] | Response:
+    """Delete all scans from the database."""
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Database not available"}), 503
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM scans")
+            deleted_count = cur.rowcount
+            conn.commit()
+
+        return jsonify({"success": True, "deleted_count": deleted_count})
+    except psycopg2.Error as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    init_database()
+    app.run(host="0.0.0.0", port=5001, debug=True)

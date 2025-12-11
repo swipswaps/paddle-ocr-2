@@ -1,0 +1,54 @@
+name: hybrid_ocr_app
+description: A hybrid OCR mobile app with ML Kit, Tesseract, and PaddleOCR support
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  
+  # OCR Engines
+  google_mlkit_text_recognition: ^0.13.0  # Fast, mobile-optimized OCR (2-3s)
+  flutter_tesseract_ocr: ^0.4.24          # Offline OCR fallback (5-8s)
+  
+  # Image Processing
+  image: ^4.1.7                            # Image manipulation
+  camera: ^0.11.0                          # Camera access
+  image_picker: ^1.0.7                     # Gallery/camera picker
+  
+  # Local Storage
+  sqflite: ^2.3.2                          # SQLite database
+  path_provider: ^2.1.2                    # File system paths
+  
+  # HTTP Client (for Docker backend)
+  http: ^1.2.0                             # REST API calls
+  
+  # State Management
+  flutter_bloc: ^8.1.4                     # BLoC pattern
+  equatable: ^2.0.5                        # Value equality
+  
+  # UI Components
+  cupertino_icons: ^1.0.6                  # iOS icons
+  intl: ^0.19.0                            # Internationalization
+  sqflite_common_ffi: ^2.3.4+4
+  file_selector: ^1.0.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+  
+  # Assets
+  # assets:
+  #   - assets/images/
+  #   - assets/icons/
+
+# Platform-specific configuration
+# See android/app/build.gradle and ios/Runner/Info.plist for permissions
+

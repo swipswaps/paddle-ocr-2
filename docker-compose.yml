@@ -1,0 +1,71 @@
+# PaddleOCR App - Docker Compose Configuration
+#
+# Usage:
+#   docker compose up -d     # Start all services
+#   docker compose logs -f   # View logs
+#   docker compose down      # Stop all services
+
+services:
+  # PaddleOCR Backend with PostgreSQL
+  paddleocr-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: paddleocr-backend
+    ports:
+      - "5001:5001"
+    environment:
+      - FLASK_ENV=production
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=paddleocr_app
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: paddleocr-postgres
+    environment:
+      - POSTGRES_DB=paddleocr_app
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d paddleocr_app"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Frontend (Vite dev server)
+  paddleocr-frontend:
+    image: node:20-alpine
+    container_name: paddleocr-frontend
+    working_dir: /app
+    volumes:
+      - .:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    environment:
+      - VITE_API_URL=http://localhost:5001
+    depends_on:
+      - paddleocr-backend
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+

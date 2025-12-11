@@ -1,0 +1,463 @@
+import os
+import time
+import json
+import logging
+import threading
+import queue
+import psutil
+import psycopg2
+from flask import Flask, request, jsonify, Response, stream_with_context
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
+from psycopg2.extras import RealDictCursor
+import sys
+from PIL import Image
+
+# Import OCR logic
+try:
+    from ocr import process_image
+    from hybrid_ocr_service import HybridOCRService
+    from receipt_parser import ReceiptParser
+except ImportError:
+    # Fallback for when running directly without package structure
+    from backend.ocr import process_image
+    from backend.hybrid_ocr_service import HybridOCRService
+    from backend.receipt_parser import ReceiptParser
+
+# Initialize services
+hybrid_ocr = HybridOCRService()
+receipt_parser = ReceiptParser()
+
+# Image processing configuration
+MAX_IMAGE_DIMENSION = 2048  # Max width or height in pixels
+MAX_FILE_SIZE_MB = 10  # Max file size before resizing
+
+app = Flask(__name__)
+CORS(app)
+
+# --- Configuration ---
+UPLOAD_FOLDER = '/tmp/uploads'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'tiff', 'bmp', 'gif'}
+# Support both DB_HOST and POSTGRES_HOST for compatibility
+DB_HOST = os.environ.get('DB_HOST', os.environ.get('POSTGRES_HOST', 'postgres'))
+DB_NAME = os.environ.get('DB_NAME', os.environ.get('POSTGRES_DB', 'paddleocr_app'))
+DB_USER = os.environ.get('DB_USER', os.environ.get('POSTGRES_USER', 'postgres'))
+DB_PASS = os.environ.get('DB_PASS', os.environ.get('POSTGRES_PASSWORD', 'postgres'))
+
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# --- Logging & SSE Setup ---
+# Thread-safe queue for log distribution
+log_queue = queue.Queue(maxsize=1000)
+
+class LogBufferHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            log_queue.put(json.dumps({
+                'ts': record.created,
+                'level': record.levelname,
+                'msg': msg
+            }))
+        except queue.Full:
+            pass # Drop logs if queue is full to prevent blocking
+
+# Setup Root Logger
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+buffer_handler = LogBufferHandler()
+formatter = logging.Formatter('%(message)s')
+buffer_handler.setFormatter(formatter)
+logger.addHandler(buffer_handler)
+
+# Capture stdout/stderr to push to log_queue as well (for Paddle/System logs)
+class StreamToLogger(object):
+    def __init__(self, logger, level):
+        self.logger = logger
+        self.level = level
+        self.linebuf = ''
+
+    def write(self, buf):
+        for line in buf.rstrip().splitlines():
+            self.logger.log(self.level, line.rstrip())
+
+    def flush(self):
+        pass
+
+sys.stdout = StreamToLogger(logger, logging.INFO)
+sys.stderr = StreamToLogger(logger, logging.ERROR)
+
+# --- Database Helpers ---
+def get_db_connection():
+    conn = psycopg2.connect(
+        host=DB_HOST,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS
+    )
+    return conn
+
+def init_db():
+    """Initialize database schema on startup"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS scans (
+                id SERIAL PRIMARY KEY,
+                filename VARCHAR(255) NOT NULL,
+                raw_text TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        logging.info("[SYSTEM] Database initialized successfully.")
+    except Exception as e:
+        logging.error(f"[SYSTEM] Database init failed: {e}")
+
+# Initialize DB immediately
+init_db()
+
+# --- System Monitoring Thread ---
+def monitor_system():
+    """Background thread to push system stats to logs"""
+    while True:
+        try:
+            # 1. Basic Metrics
+            cpu = psutil.cpu_percent(interval=None)
+            mem = psutil.virtual_memory()
+            net = psutil.net_io_counters()
+            net_rx_mb = net.bytes_recv / (1024 * 1024)
+            
+            metric_msg = f"[METRIC] CPU: {cpu}% RAM: {mem.used//(1024*1024)}/{mem.total//(1024*1024)}MB NET_RX: {net_rx_mb:.1f}MB"
+            logger.info(metric_msg)
+
+            # 2. Top Processes (mock 'top')
+            procs = []
+            for proc in psutil.process_iter(['pid', 'name', 'username', 'cpu_percent', 'memory_percent']):
+                try:
+                    pinfo = proc.info
+                    # Filter for relevant processes
+                    if pinfo['cpu_percent'] > 0.0 or 'python' in pinfo['name'] or 'gunicorn' in pinfo['name']:
+                        procs.append(pinfo)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            
+            # Sort by CPU usage
+            procs.sort(key=lambda x: x['cpu_percent'], reverse=True)
+            top_procs = procs[:5] # Top 5
+            
+            logger.info(f"[TOP] {json.dumps(top_procs)}")
+            
+            time.sleep(2) 
+        except Exception as e:
+            time.sleep(5)
+
+# Start Monitor
+monitor_thread = threading.Thread(target=monitor_system, daemon=True)
+monitor_thread.start()
+
+# --- Routes ---
+
+@app.route('/health', methods=['GET'])
+def health():
+    try:
+        mem = psutil.virtual_memory()
+        return jsonify({
+            'status': 'online',
+            'cpu_percent': psutil.cpu_percent(),
+            'memory_used': mem.used / (1024 * 1024),
+            'memory_total': mem.total / (1024 * 1024)
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'msg': str(e)}), 500
+
+@app.route('/logs/stream')
+def stream_logs():
+    def generate():
+        while True:
+            try:
+                # Get log from queue, wait up to 1s
+                msg_data = log_queue.get(timeout=1.0)
+                yield f"data: {msg_data}\n\n"
+            except queue.Empty:
+                # Send heartbeat to keep connection alive
+                yield ": heartbeat\n\n"
+            except GeneratorExit:
+                break
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def resize_image_if_needed(filepath):
+    """
+    Resize image if it's too large for efficient OCR processing.
+    Returns: (resized_path, was_resized, original_size, new_size)
+    """
+    try:
+        img = Image.open(filepath)
+        original_size = img.size
+        width, height = original_size
+
+        # Check if resizing is needed
+        max_dim = max(width, height)
+        if max_dim <= MAX_IMAGE_DIMENSION:
+            logging.info(f"[ INFO] Image size OK: {width}x{height}, no resize needed")
+            return filepath, False, original_size, original_size
+
+        # Calculate new dimensions maintaining aspect ratio
+        if width > height:
+            new_width = MAX_IMAGE_DIMENSION
+            new_height = int(height * (MAX_IMAGE_DIMENSION / width))
+        else:
+            new_height = MAX_IMAGE_DIMENSION
+            new_width = int(width * (MAX_IMAGE_DIMENSION / height))
+
+        # Resize image
+        logging.info(f"[ INFO] Resizing image from {width}x{height} to {new_width}x{new_height}")
+        resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+        # Save resized image
+        resized_path = filepath.replace('.', '_resized.')
+        resized_img.save(resized_path, quality=95, optimize=True)
+
+        new_size = (new_width, new_height)
+        logging.info(f"[ INFO] Image resized successfully: {resized_path}")
+
+        return resized_path, True, original_size, new_size
+
+    except Exception as e:
+        logging.error(f"[ERROR] Image resize failed: {e}")
+        return filepath, False, None, None
+
+@app.route('/ocr', methods=['POST'])
+def run_ocr():
+    """
+    Legacy OCR endpoint - uses PaddleOCR only (for backward compatibility).
+
+    For better performance, use /ocr/hybrid endpoint instead.
+
+    Logs are streamed in real-time via SSE to /logs/stream.
+
+    During the 60-90s OCR processing phase, the app displays REAL system data:
+    - CPU usage of the OCR process (shows active processing)
+    - Memory consumption (shows model loading and inference)
+    - Disk I/O activity (shows model file reads)
+    - Thread count (shows parallel processing)
+    - Estimated progress based on actual CPU activity
+
+    All monitoring data comes from psutil - it's REAL system metrics, not fabricated.
+    """
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+
+        try:
+            # Pass a callback to push specific OCR progress updates
+            # These are logged with [ INFO] prefix to match frontend expectations
+            def progress_callback(msg):
+                logging.info(f"[ INFO] {msg}")
+
+            result = process_image(filepath, log_callback=progress_callback)
+
+            # Automatically save to database
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO scans (filename, raw_text) VALUES (%s, %s) RETURNING id",
+                    (filename, result['raw_text'])
+                )
+                scan_id = cur.fetchone()[0]
+                conn.commit()
+                cur.close()
+                conn.close()
+                result['db_id'] = scan_id
+                logging.info(f"[ INFO] Saved to database (ID: {scan_id})")
+            except Exception as e:
+                logging.error(f"[ERROR] Database save failed: {e}")
+                # Don't fail the request if DB save fails
+
+            return jsonify(result)
+
+        except Exception as e:
+            logging.error(f"[ERROR] OCR processing failed: {str(e)}")
+            import traceback
+            logging.error(f"[ERROR] Traceback: {traceback.format_exc()}")
+            return jsonify({'error': str(e)}), 500
+
+    return jsonify({'error': 'File type not allowed'}), 400
+
+@app.route('/ocr/hybrid', methods=['POST'])
+def run_hybrid_ocr():
+    """
+    Hybrid OCR endpoint - uses multi-engine cascade for better performance.
+
+    Process:
+    1. Try Tesseract first (5-8 seconds, with rotation correction)
+    2. If confidence >= 0.85, return Tesseract result
+    3. Otherwise, fall back to PaddleOCR (60-90 seconds)
+
+    Average processing time: ~15 seconds (vs 60-90 seconds with PaddleOCR only)
+
+    Query parameters:
+    - engine: 'auto' (default), 'tesseract', or 'paddleocr' to force specific engine
+    """
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+
+        try:
+            # Resize image if needed for faster processing
+            processed_path, was_resized, original_size, new_size = resize_image_if_needed(filepath)
+
+            # Get engine preference from query params
+            engine = request.args.get('engine', 'auto')
+
+            # Pass a callback to push specific OCR progress updates
+            def progress_callback(msg):
+                logging.info(f"[ INFO] {msg}")
+
+            # Use hybrid OCR service
+            result = hybrid_ocr.process_with_engine(processed_path, engine=engine, log_callback=progress_callback)
+
+            # Add resize info to result
+            if was_resized:
+                result['image_resized'] = True
+                result['original_size'] = original_size
+                result['processed_size'] = new_size
+                logging.info(f"[ INFO] Image was resized from {original_size} to {new_size}")
+
+            # Automatically save to database
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+
+                # Store additional metadata
+                metadata = {
+                    'engine': result.get('engine', 'unknown'),
+                    'confidence': result.get('confidence', 0.0),
+                    'duration': result.get('duration', 0.0),
+                    'rotation': result.get('rotation', 0)
+                }
+
+                cur.execute(
+                    "INSERT INTO scans (filename, raw_text) VALUES (%s, %s) RETURNING id",
+                    (filename, result.get('raw_text', ''))
+                )
+                scan_id = cur.fetchone()[0]
+                conn.commit()
+                cur.close()
+                conn.close()
+                result['db_id'] = scan_id
+                logging.info(f"[ INFO] Saved to database (ID: {scan_id}) - Engine: {metadata['engine']}, Confidence: {metadata['confidence']:.2f}")
+            except Exception as e:
+                logging.error(f"[ERROR] Database save failed: {e}")
+                # Don't fail the request if DB save fails
+
+            return jsonify(result)
+
+        except Exception as e:
+            logging.error(f"[ERROR] Hybrid OCR processing failed: {str(e)}")
+            import traceback
+            logging.error(f"[ERROR] Traceback: {traceback.format_exc()}")
+            return jsonify({'error': str(e)}), 500
+
+    return jsonify({'error': 'File type not allowed'}), 400
+
+@app.route('/ocr/parse', methods=['POST'])
+def parse_receipt():
+    """
+    Parse OCR text to extract structured receipt data.
+
+    Request body:
+    {
+        "text": "OCR extracted text"
+    }
+
+    Returns:
+    {
+        "merchant": str,
+        "date": str,
+        "time": str,
+        "total": float,
+        "subtotal": float,
+        "tax": float,
+        "items": [{"description": str, "price": float}],
+        "validation": {"valid": bool, "message": str}
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data or 'text' not in data:
+            return jsonify({'error': 'No text provided'}), 400
+
+        text = data['text']
+
+        # Parse receipt
+        parsed = receipt_parser.parse(text)
+
+        # Validate totals
+        parsed = receipt_parser.validate_totals(parsed)
+
+        logging.info(f"[ INFO] Parsed receipt: Merchant={parsed.get('merchant')}, Total=${parsed.get('total')}, Items={len(parsed.get('items', []))}")
+
+        return jsonify(parsed)
+
+    except Exception as e:
+        logging.error(f"[ERROR] Receipt parsing failed: {str(e)}")
+        import traceback
+        logging.error(f"[ERROR] Traceback: {traceback.format_exc()}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/scans', methods=['GET'])
+def list_scans():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM scans ORDER BY created_at DESC LIMIT 50")
+        scans = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({'scans': scans})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/scans/<int:scan_id>', methods=['DELETE'])
+def delete_scan(scan_id):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM scans WHERE id = %s", (scan_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    # Use threaded=True for dev server to support SSE + processing
+    app.run(host='0.0.0.0', port=5001, debug=True, threaded=True)
